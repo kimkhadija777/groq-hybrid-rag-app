@@ -21,9 +21,9 @@ st.title("📚 AI Document Assistant with Hybrid RAG")
 # Initialize Session State
 # -----------------------------------------------------------------------------
 if "chunks" not in st.session_state:
-    st.session_state.chunks = []  # List of chunk texts
+    st.session_state.chunks = []
 if "metadata" not in st.session_state:
-    st.session_state.metadata = []  # Metadata dicts per chunk
+    st.session_state.metadata = []
 if "faiss_index" not in st.session_state:
     st.session_state.faiss_index = None
 if "bm25" not in st.session_state:
@@ -39,20 +39,23 @@ def load_embedding_model():
 embedding_model = load_embedding_model()
 
 # -----------------------------------------------------------------------------
-# Retrieve Groq API Key from Streamlit Secrets or Sidebar Input
+# Secure Groq API Key Retrieval (No Sidebar Exposure)
 # -----------------------------------------------------------------------------
 secret_api_key = st.secrets.get("GROQ_API_KEY", "") if "GROQ_API_KEY" in st.secrets else ""
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # Pre-fill with Streamlit secret if available
-    groq_api_key = st.text_input(
-        "Groq API Key", 
-        value=secret_api_key, 
-        type="password", 
-        help="Enter your Groq API Key or set GROQ_API_KEY in Streamlit Secrets"
-    )
+    # Hide API Key input box completely if configured in secrets
+    if secret_api_key:
+        groq_api_key = secret_api_key
+        st.success("✓ Groq API Key Loaded from Secrets")
+    else:
+        groq_api_key = st.text_input(
+            "Groq API Key", 
+            type="password", 
+            help="Add GROQ_API_KEY in Streamlit Secrets to remove this box."
+        )
     
     selected_model = st.selectbox(
         "Groq LLM Model",
@@ -66,7 +69,7 @@ with st.sidebar:
     source_tab1, source_tab2 = st.tabs(["Local Upload", "Google Drive"])
 
 # -----------------------------------------------------------------------------
-# File Loaders & Chunking Functions
+# File Processing Functions
 # -----------------------------------------------------------------------------
 def extract_text_from_file(file_path, filename):
     ext = os.path.splitext(filename)[1].lower()
@@ -121,7 +124,7 @@ def process_documents(files_dict):
     all_chunks = []
     all_metadata = []
     
-    with st.spinner("Extracting text and generating chunks..."):
+    with st.spinner("Extracting text and building chunks..."):
         for filename, filepath in files_dict.items():
             raw_text = extract_text_from_file(filepath, filename)
             if raw_text.strip():
@@ -136,8 +139,8 @@ def process_documents(files_dict):
     st.session_state.chunks = all_chunks
     st.session_state.metadata = all_metadata
 
-    # 1. Generate Dense Embeddings & FAISS Index
-    with st.spinner("Generating embeddings & building FAISS vector database..."):
+    # 1. FAISS Indexing
+    with st.spinner("Generating embeddings & building FAISS index..."):
         embeddings = embedding_model.encode(all_chunks, convert_to_numpy=True, show_progress_bar=False)
         embeddings = np.array(embeddings, dtype=np.float32)
         
@@ -148,7 +151,7 @@ def process_documents(files_dict):
         index.add(embeddings)
         st.session_state.faiss_index = index
 
-    # 2. Build Sparse BM25 Keyword Model
+    # 2. BM25 Sparse Indexing
     with st.spinner("Building BM25 keyword index..."):
         tokenized_corpus = [re.findall(r'\w+', doc.lower()) for doc in all_chunks]
         st.session_state.bm25 = BM25Okapi(tokenized_corpus)
@@ -156,7 +159,7 @@ def process_documents(files_dict):
     st.success(f"Successfully processed {len(all_chunks)} unique document chunks!")
 
 # -----------------------------------------------------------------------------
-# Sidebar Actions: Ingestion Tabs
+# Sidebar Actions: Document Ingestion
 # -----------------------------------------------------------------------------
 with source_tab1:
     uploaded_files = st.file_uploader(
@@ -176,12 +179,16 @@ with source_tab1:
             process_documents(temp_files)
 
 with source_tab2:
-    drive_folder_url = st.text_input("Google Drive Folder Link", help="Ensure link sharing is set to 'Anyone with the link'")
+    drive_folder_url = st.text_input(
+        "Google Drive Folder Link", 
+        help="Make sure link sharing is set to 'Anyone with the link can view'"
+    )
     if st.button("Download & Process Drive Folder") and drive_folder_url:
         with tempfile.TemporaryDirectory() as temp_dir:
             with st.spinner("Downloading files from Google Drive..."):
                 try:
-                    gdown.download_folder(url=drive_folder_url, output=temp_dir, quiet=True, remaining_ok=True)
+                    # Clean fixed gdown call without outdated parameters
+                    gdown.download_folder(url=drive_folder_url, output=temp_dir, quiet=True)
                     drive_files = {}
                     
                     supported_exts = (".pdf", ".docx", ".txt", ".md")
@@ -194,7 +201,7 @@ with source_tab2:
                     if drive_files:
                         process_documents(drive_files)
                     else:
-                        st.error("No supported PDF, DOCX, TXT, or MD files found in the Drive link.")
+                        st.error("No supported PDF, DOCX, TXT, or MD files found in the provided Drive folder.")
                 except Exception as e:
                     st.error(f"Failed to fetch Google Drive folder: {str(e)}")
 
@@ -204,7 +211,7 @@ with st.sidebar:
         st.metric("Total Indexed Chunks", len(st.session_state.chunks))
 
 # -----------------------------------------------------------------------------
-# Hybrid Retrieval Function
+# Hybrid Retrieval Pipeline
 # -----------------------------------------------------------------------------
 def hybrid_search(query, top_k=4, alpha=0.6):
     if not st.session_state.faiss_index or not st.session_state.bm25:
@@ -213,7 +220,7 @@ def hybrid_search(query, top_k=4, alpha=0.6):
     num_chunks = len(st.session_state.chunks)
     actual_k = min(top_k * 3, num_chunks)
 
-    # 1. Semantic Search (FAISS)
+    # Dense Search
     query_vector = embedding_model.encode([query], convert_to_numpy=True)
     query_vector = np.array(query_vector, dtype=np.float32)
     faiss.normalize_L2(query_vector)
@@ -228,14 +235,14 @@ def hybrid_search(query, top_k=4, alpha=0.6):
     if np.max(dense_scores) > np.min(dense_scores):
         dense_scores = (dense_scores - np.min(dense_scores)) / (np.max(dense_scores) - np.min(dense_scores) + 1e-8)
 
-    # 2. Keyword Search (BM25)
+    # Sparse BM25 Search
     tokenized_query = re.findall(r'\w+', query.lower())
     sparse_scores = np.array(st.session_state.bm25.get_scores(tokenized_query))
     
     if np.max(sparse_scores) > np.min(sparse_scores):
         sparse_scores = (sparse_scores - np.min(sparse_scores)) / (np.max(sparse_scores) - np.min(sparse_scores) + 1e-8)
 
-    # 3. Hybrid Combined Score
+    # Combined Score
     hybrid_scores = alpha * dense_scores + (1 - alpha) * sparse_scores
     ranked_indices = np.argsort(hybrid_scores)[::-1][:top_k]
 
@@ -255,9 +262,9 @@ def hybrid_search(query, top_k=4, alpha=0.6):
 # Main Chat & Search Interface
 # -----------------------------------------------------------------------------
 if not st.session_state.chunks:
-    st.info("👈 Upload your documents or add a Google Drive folder link in the sidebar to get started.")
+    st.info("👈 Upload your documents or enter a Google Drive folder link in the sidebar to get started.")
 else:
-    query = st.text_input("🔍 Ask a question about your documents:", placeholder="e.g., Summarize the primary objectives described in the text.")
+    query = st.text_input("🔍 Ask a question about your documents:", placeholder="e.g., What are the key points of this document?")
 
     if query:
         results = hybrid_search(query, top_k=4, alpha=0.6)
@@ -272,7 +279,7 @@ else:
         st.subheader("🤖 AI Answer")
 
         if not groq_api_key:
-            st.warning("Please provide a valid Groq API Key in the sidebar or in Streamlit Secrets.")
+            st.warning("Please provide a valid Groq API Key in Streamlit Secrets.")
         else:
             try:
                 client = Groq(api_key=groq_api_key)
@@ -280,8 +287,8 @@ else:
                 context = "\n\n---\n\n".join([f"Source: {r['metadata']['source']}\n{r['chunk']}" for r in results])
                 
                 system_prompt = (
-                    "You are a helpful AI document assistant. Answer the user's question accurately using ONLY "
-                    "the provided context chunks. If the answer cannot be found in the context, clearly state that."
+                    "You are a helpful AI document assistant. Answer the question accurately using ONLY "
+                    "the provided context chunks. If the answer cannot be found in the context, state that clearly."
                 )
                 user_prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
 
@@ -299,3 +306,4 @@ else:
                     st.write(chat_completion.choices[0].message.content)
             except Exception as e:
                 st.error(f"Groq API Error: {str(e)}")
+            
